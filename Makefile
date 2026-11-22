@@ -16,7 +16,7 @@ build:
 
 ## Run the image on all 36 edge-case fixtures and diff against the expected tables
 fixtures: build
-	python3 scripts/run_fixtures.py $(FIXTURES) -- scripts/docker_run.sh
+	python3 run_fixtures.py $(FIXTURES) -- ./docker_run.sh
 
 ## Make the 1M-event dev set with the published generator (needs `generate` on PATH)
 dev:
@@ -24,9 +24,9 @@ dev:
 
 ## Run on the dev set with scorer flags and time it
 run-dev: build
-	rm -rf out && time scripts/docker_run.sh $(DEV) out
+	rm -rf out && time ./docker_run.sh $(DEV) out
 
 ## Compare your dev output with the published dev answer (dev-answer.zip, unzipped): make check-dev ANSWER=dev-answer
 ANSWER ?= dev-answer
 check-dev:
-	python3 scripts/compare.py out $(ANSWER)
+python3 compare.py out $(ANSWER)
