@@ -1,446 +1,390 @@
 #!/usr/bin/env python3
-"""Shopping Sessions pipeline.
-
-Raw event, click and link files are parsed with the challenge's strict CSV
-rules. DuckDB performs the large relational operations and may spill to SCRATCH.
 """
-import csv
+Shopping Sessions: Polars implementation.
+
+Reads $DATA_DIR, writes $OUTPUT_DIR/user_daily/ and campaign_daily/ as Parquet.
+Implements the full rules spec: custom CSV dialect, timestamp forms F1/F2/F3,
+linked-ID union-find, event dedup-before-validation, sessionization, and
+click attribution with assists.
+"""
 import glob
 import json
 import os
-import shutil
-from pathlib import Path
+import re
+import bisect
+from datetime import datetime, timezone, timedelta
 
-import duckdb
+NCPU = os.environ.get("NCPU")
+if NCPU:
+    os.environ.setdefault("POLARS_MAX_THREADS", NCPU)
+
+import polars as pl  # noqa: E402
 
 DATA = os.environ.get("DATA_DIR", "/data")
 OUT = os.environ.get("OUTPUT_DIR", "/output")
-SCRATCH = os.environ.get("SCRATCH_DIR", "/scratch")
-NCPU = max(1, int(os.environ.get("NCPU", os.cpu_count() or 1)))
-MEM_GB = max(1, int(os.environ.get("MEM_GB", "24")))
+
+MS_PER_DAY = 86_400_000
+MS_PER_7_DAYS = 7 * MS_PER_DAY
+SESSION_GAP_MS = 1_800_000
+
+RE_F1 = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z$")
+RE_F2 = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})([+-])(\d{2}):(\d{2})$")
+RE_DIGITS = re.compile(r"^\d+$")
 
 
-def strict_fields(line):
-    """Parse one line of the specified CSV dialect; return None if malformed.
+def is_leap(y):
+    return y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)
 
-    The caller removes LF only. CR is ordinary field data and is retained.
-    Quotes may surround a complete field only. Empty fields become None.
-    """
+
+def _valid_calendar(y, mo, d, h, mi, sec):
+    if mo < 1 or mo > 12 or d < 1 or h > 23 or mi > 59 or sec > 59:
+        return False
+    if mo in (4, 6, 9, 11):
+        return d <= 30
+    if mo == 2:
+        return d <= (29 if is_leap(y) else 28)
+    return d <= 31
+
+
+def parse_ts(s):
+    if not s:
+        return None
+    m = RE_F1.match(s)
+    if m:
+        y, mo, d, h, mi, sec = (int(g) for g in m.groups())
+        if not _valid_calendar(y, mo, d, h, mi, sec):
+            return None
+        return int(datetime(y, mo, d, h, mi, sec, tzinfo=timezone.utc).timestamp() * 1000)
+    m = RE_F2.match(s)
+    if m:
+        y, mo, d, h, mi, sec, sign, oh, om = m.groups()
+        y, mo, d, h, mi, sec = int(y), int(mo), int(d), int(h), int(mi), int(sec)
+        oh, om = int(oh), int(om)
+        if oh > 23 or om > 59:
+            return None
+        if not _valid_calendar(y, mo, d, h, mi, sec):
+            return None
+        offset = timedelta(hours=oh, minutes=om)
+        if sign == "-":
+            offset = -offset
+        dt = datetime(y, mo, d, h, mi, sec, tzinfo=timezone.utc) - offset
+        return int(dt.timestamp() * 1000)
+    if RE_DIGITS.match(s):
+        try:
+            return int(s)
+        except ValueError:
+            return None
+    return None
+
+
+def parse_csv_line(line, n_fields):
     if line == "":
         return None
-    out = []
-    i = 0
-    n = len(line)
-    while True:
-        if i < n and line[i] == '"':
-            i += 1
-            j = line.find('"', i)
-            if j < 0:
+    fields = []
+    i, n = 0, len(line)
+    while i < n:
+        if line[i] == '"':
+            if i > 0 and line[i - 1] != ",":
                 return None
-            value = line[i:j]
+            j = i + 1
+            while j < n and line[j] != '"':
+                j += 1
+            if j >= n:
+                return None
+            fields.append(line[i + 1:j])
             i = j + 1
-            if i < n and line[i] != ",":
-                return None
-        else:
-            j = line.find(",", i)
-            if j < 0:
-                value = line[i:]
-                i = n
-            else:
-                value = line[i:j]
-                if '"' in value:
+            if i < n:
+                if line[i] == ",":
+                    i += 1
+                else:
                     return None
-                i = j
-        out.append(value if value != "" else None)
-        if i >= n:
-            break
-        if line[i] != ",":
-            return None
-        i += 1
-        if i == n:
-            out.append(None)
-            break
-    return out
+        else:
+            j = i
+            while j < n and line[j] != "," and line[j] != '"':
+                j += 1
+            if j < n and line[j] == '"':
+                return None
+            fields.append(line[i:j])
+            i = j + 1
+    if len(fields) != n_fields:
+        return None
+    return fields
 
 
-def parse_raw_files(data_dir, scratch_dir, folder, prefix, expected_fields):
-    """Strictly parse all CSV parts and write normalized CSV parts to scratch."""
-    source_paths = sorted(glob.glob(os.path.join(data_dir, folder, "*.csv")))
-    if not source_paths:
-        raise FileNotFoundError(f"No CSV files found in {data_dir}/{folder}/")
-    target_dir = os.path.join(scratch_dir, f"parsed_{prefix}")
-    os.makedirs(target_dir, exist_ok=True)
-    total = 0
-    for file_no, source in enumerate(source_paths):
-        target = os.path.join(target_dir, f"{prefix}-{file_no:05d}.csv")
-        with open(source, "r", encoding="utf-8", newline="\n") as src, \
-             open(target, "w", encoding="utf-8", newline="") as dst:
-            reader = iter(src)
-            next(reader, None)  # every input file has its own header
-            writer = csv.writer(dst, lineterminator="\n")
-            writer.writerow(expected_fields)
-            for raw in reader:
-                # Remove LF, never strip CR or whitespace.
-                line = raw[:-1] if raw.endswith("\n") else raw
-                row = strict_fields(line)
-                if row is None or len(row) != len(expected_fields):
-                    continue
-                writer.writerow(row)
-                total += 1
-    return os.path.join(target_dir, "*.csv"), total
-
-
-class DSU:
-    """Union-find for transitive linked user IDs."""
-    __slots__ = ("parent", "rank")
-
+class UnionFind:
     def __init__(self):
         self.parent = {}
-        self.rank = {}
-
-    def add(self, x):
-        if x not in self.parent:
-            self.parent[x] = x
-            self.rank[x] = 0
 
     def find(self, x):
-        p = self.parent[x]
-        while p != self.parent[p]:
-            self.parent[p] = self.parent[self.parent[p]]
-            p = self.parent[p]
-        while x != p:
-            nxt = self.parent[x]
-            self.parent[x] = p
-            x = nxt
-        return p
+        if x not in self.parent:
+            self.parent[x] = x
+            return x
+        if self.parent[x] != x:
+            self.parent[x] = self.find(self.parent[x])
+        return self.parent[x]
 
-    def union(self, a, b):
-        self.add(a)
-        self.add(b)
-        ra, rb = self.find(a), self.find(b)
-        if ra == rb:
-            return
-        if self.rank[ra] < self.rank[rb]:
-            ra, rb = rb, ra
-        self.parent[rb] = ra
-        if self.rank[ra] == self.rank[rb]:
-            self.rank[ra] += 1
-
-
-def load_links(data_dir, scratch_dir):
-    dsu = DSU()
-    paths = sorted(glob.glob(os.path.join(data_dir, "links", "*.csv")))
-    if not paths:
-        raise FileNotFoundError(f"No CSV files found in {data_dir}/links/")
-    for path in paths:
-        with open(path, "r", encoding="utf-8", newline="\n") as f:
-            next(f, None)
-            for raw in f:
-                line = raw[:-1] if raw.endswith("\n") else raw
-                row = strict_fields(line)
-                if row is None or len(row) != 2 or not row[0] or not row[1]:
-                    continue
-                dsu.union(row[0], row[1])
-
-    # Canonical names are byte-wise smallest, including linked IDs never used
-    # by an event or click.
-    members = {}
-    for value in dsu.parent:
-        members.setdefault(dsu.find(value), []).append(value)
-    mapping_path = os.path.join(scratch_dir, "person_map.csv")
-    with open(mapping_path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f, lineterminator="\n")
-        writer.writerow(["user_id", "person_id"])
-        for values in members.values():
-            canonical = min(values, key=lambda value: value.encode("utf-8"))
-            for value in values:
-                writer.writerow([value, canonical])
-    return mapping_path, len(dsu.parent)
-
-
-def qpath(path):
-    return "'" + path.replace("'", "''") + "'"
-
-
-def read_clean_table(con, table_name, pattern, columns):
-    """Load normalized CSV parts; all source fields remain VARCHAR."""
-    cols = ",".join(f"'{name}':'VARCHAR'" for name in columns)
-    con.execute(
-        f"CREATE TEMP TABLE {table_name} AS "
-        f"SELECT * FROM read_csv({qpath(pattern)}, header=true, "
-        f"columns={{{cols}}}, delim=',', quote='\"', escape='\"', "
-        f"new_line='\\n', nullstr='', union_by_name=true, "
-        f"strict_mode=true, ignore_errors=false)"
-    )
+    def union(self, x, y):
+        self.parent[self.find(x)] = self.find(y)
 
 
 def main():
-    os.makedirs(SCRATCH, exist_ok=True)
-    os.makedirs(OUT, exist_ok=True)
-    temp_dir = os.path.join(SCRATCH, "duckdb_tmp")
-    os.makedirs(temp_dir, exist_ok=True)
-
-    with open(os.path.join(DATA, "manifest.json"), encoding="utf-8") as f:
+    with open(os.path.join(DATA, "manifest.json")) as f:
         manifest = json.load(f)
-    start_text = manifest["window_start"]
-    end_text = manifest["window_end"]
-    # The manifest timestamps are guaranteed UTC F1.
-    from datetime import datetime, timezone
-    start_dt = datetime.strptime(start_text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-    end_dt = datetime.strptime(end_text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    start_ms = int((start_dt - epoch).total_seconds() * 1000)
-    end_ms = int((end_dt - epoch).total_seconds() * 1000)
+    window_start = parse_ts(manifest["window_start"])
+    window_end = parse_ts(manifest["window_end"])
+    click_window_start = window_start - MS_PER_7_DAYS
 
-    event_pattern, event_rows = parse_raw_files(
-        DATA, SCRATCH, "events", "events",
-        ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"],
-    )
-    click_pattern, click_rows = parse_raw_files(
-        DATA, SCRATCH, "clicks", "clicks",
-        ["click_id", "user_id", "campaign_id", "ts"],
-    )
-    map_path, link_ids = load_links(DATA, SCRATCH)
-    print(
-        f"window {start_text} .. {end_text}; parsed event rows={event_rows}; "
-        f"click rows={click_rows}; linked IDs={link_ids}", flush=True
-    )
+    products = {}
+    with open(os.path.join(DATA, "products.csv"), "r", encoding="utf-8") as f:
+        f.readline()
+        for line in f:
+            fields = parse_csv_line(line.rstrip("\n"), 2)
+            if fields:
+                products[fields[0]] = fields[1]
 
-    con = duckdb.connect()
-    con.execute(f"SET threads={NCPU}")
-    con.execute(f"SET memory_limit='{max(1, int(MEM_GB * 0.80))}GB'")
-    con.execute(f"SET temp_directory={qpath(temp_dir)}")
-    con.execute("SET preserve_insertion_order=false")
-    con.execute("SET TimeZone='UTC'")
+    campaigns = {}
+    with open(os.path.join(DATA, "campaigns.csv"), "r", encoding="utf-8") as f:
+        f.readline()
+        for line in f:
+            fields = parse_csv_line(line.rstrip("\n"), 2)
+            if fields:
+                campaigns[fields[0]] = fields[1]
 
-    read_clean_table(con, "event_raw", event_pattern,
-                     ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"])
-    read_clean_table(con, "click_raw", click_pattern,
-                     ["click_id", "user_id", "campaign_id", "ts"])
-    con.execute(
-        f"CREATE TEMP TABLE people AS SELECT * FROM read_csv({qpath(map_path)}, "
-        "header=true, all_varchar=true, delim=',', quote='\"', escape='\"', nullstr='')"
-    )
-    con.execute(
-        f"CREATE TEMP TABLE products AS SELECT product_id, category FROM "
-        f"read_csv({qpath(os.path.join(DATA, 'products.csv'))}, header=true, "
-        "all_varchar=true, delim=',', quote='\"', escape='\"', nullstr='')"
-    )
-    con.execute(
-        f"CREATE TEMP TABLE campaigns AS SELECT campaign_id, channel FROM "
-        f"read_csv({qpath(os.path.join(DATA, 'campaigns.csv'))}, header=true, "
-        "all_varchar=true, delim=',', quote='\"', escape='\"', nullstr='')"
-    )
+    uf = UnionFind()
+    for fpath in sorted(glob.glob(os.path.join(DATA, "links", "*.csv"))):
+        with open(fpath, "r", encoding="utf-8") as f:
+            f.readline()
+            for line in f:
+                fields = parse_csv_line(line.rstrip("\n"), 2)
+                if not fields:
+                    continue
+                a, b = fields
+                if a == "" or b == "":
+                    continue
+                uf.union(a, b)
 
-    # Strict timestamp grammar plus calendar-aware parsing. F3 overflow is
-    # represented as NULL, which makes it fail the relevant time-window test.
-    con.execute(r"""
-      CREATE MACRO ts_ms(s) AS (
-        CASE
-          WHEN regexp_full_match(s, '[0-9]+') THEN try_cast(s AS BIGINT)
-          WHEN regexp_full_match(s, '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z')
-            THEN epoch_ms(try_strptime(s, '%Y-%m-%dT%H:%M:%SZ'))
-          WHEN regexp_full_match(s, '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}:[0-9]{2}')
-            AND try_cast(regexp_extract(s, '[+-]([0-9]{2}):([0-9]{2})$', 1) AS INTEGER) BETWEEN 0 AND 23
-            AND try_cast(regexp_extract(s, '[+-]([0-9]{2}):([0-9]{2})$', 2) AS INTEGER) BETWEEN 0 AND 59
-            THEN epoch_ms(try_cast(s AS TIMESTAMPTZ))
-          ELSE NULL
-        END
-      );
-      CREATE MACRO f1_ms(s) AS (
-        CASE WHEN regexp_full_match(s, '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z')
-          THEN epoch_ms(try_strptime(s, '%Y-%m-%dT%H:%M:%SZ')) ELSE NULL END
-      );
-    """)
+    group_min = {}
+    for id_ in uf.parent:
+        root = uf.find(id_)
+        if root not in group_min or id_ < group_min[root]:
+            group_min[root] = id_
+    person_of = {id_: group_min[uf.find(id_)] for id_ in uf.parent}
 
-    # Event dedup happens after strict line parsing but before event validation.
-    # ingest_ts is guaranteed F1 by the rules.
-    con.execute("""
-      CREATE TEMP TABLE ev_dedup AS
-      SELECT *, f1_ms(ingest_ts) AS ingest_ms, ts_ms(ts) AS event_ms
-      FROM event_raw
-      WHERE event_id IS NOT NULL AND event_id <> ''
-      QUALIFY row_number() OVER (PARTITION BY event_id ORDER BY f1_ms(ingest_ts)) = 1
-    """)
-    con.execute(f"""
-      CREATE TEMP TABLE events AS
-      SELECT coalesce(p.person_id, e.user_id) AS person_id,
-             e.event_id, e.event_ms AS ts_ms, e.event_type, e.product_id,
-             CASE WHEN e.event_type='purchase' THEN try_cast(e.price_cents AS BIGINT) ELSE 0 END AS price_cents,
-             pr.category
-      FROM ev_dedup e
-      LEFT JOIN people p ON p.user_id=e.user_id
-      LEFT JOIN products pr ON pr.product_id=e.product_id
-      WHERE e.user_id IS NOT NULL AND e.user_id <> ''
-        AND e.event_ms >= {start_ms} AND e.event_ms < {end_ms}
-        AND e.event_type IN ('view','cart','purchase')
-        AND e.product_id IS NOT NULL AND e.product_id <> ''
-        AND (e.event_type <> 'purchase' OR
-             (regexp_full_match(e.price_cents, '[0-9]+')
-              AND try_cast(e.price_cents AS BIGINT) BETWEEN 1 AND 10000000))
-        AND CAST(e.ingest_ms AS HUGEINT) - CAST(e.event_ms AS HUGEINT) <= 86400000
-    """)
+    def get_person(uid):
+        return person_of.get(uid, uid)
 
-    # Sessionize distinct timestamps, so all events at the same millisecond
-    # remain together and a gap of exactly 30 minutes does not split a session.
-    con.execute("""
-      CREATE TEMP TABLE distinct_times AS
-      SELECT DISTINCT person_id, ts_ms FROM events
-    """)
-    con.execute("""
-      CREATE TEMP TABLE time_sessions AS
-      WITH boundaries AS (
-        SELECT person_id, ts_ms,
-               CASE WHEN lag(ts_ms) OVER (PARTITION BY person_id ORDER BY ts_ms) IS NULL
-                         OR ts_ms - lag(ts_ms) OVER (PARTITION BY person_id ORDER BY ts_ms) > 1800000
-                    THEN 1 ELSE 0 END AS new_session
-        FROM distinct_times
-      )
-      SELECT person_id, ts_ms,
-             sum(new_session) OVER (PARTITION BY person_id ORDER BY ts_ms
-               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS session_no
-      FROM boundaries
-    """)
-    con.execute("""
-      CREATE TEMP TABLE ev_numbered AS
-      SELECT e.*, t.session_no
-      FROM events e JOIN time_sessions t USING(person_id, ts_ms)
-    """)
-    con.execute("""
-      CREATE TEMP TABLE session_base AS
-      SELECT person_id, session_no, min(ts_ms) AS start_ms,
-             count(*)::BIGINT AS event_count,
-             sum(CASE WHEN event_type='purchase' THEN price_cents ELSE 0 END)::BIGINT AS revenue_cents,
-             bool_or(event_type='purchase') AS has_purchase
-      FROM ev_numbered GROUP BY person_id, session_no
-    """)
-    con.execute("""
-      CREATE TEMP TABLE sessions AS
-      SELECT person_id, session_no, start_ms,
-             CAST(epoch_ms(start_ms) AS DATE) AS day,
-             event_count, revenue_cents, has_purchase
-      FROM session_base
-    """)
+    raw_events = []
+    for fpath in sorted(glob.glob(os.path.join(DATA, "events", "*.csv"))):
+        with open(fpath, "r", encoding="utf-8") as f:
+            f.readline()
+            for line in f:
+                fields = parse_csv_line(line.rstrip("\n"), 7)
+                if not fields:
+                    continue
+                eid, uid, ts_str, its_str, etype, pid, price = fields
+                if eid == "":
+                    continue
+                ts = parse_ts(ts_str)
+                its = parse_ts(its_str)
+                if ts is None or its is None:
+                    continue
+                raw_events.append((eid, uid, ts, its, etype, pid, price))
 
-    # Top category is calculated over all purchases for the person/day,
-    # not independently per session.
-    con.execute("""
-      CREATE TEMP TABLE user_cat_day AS
-      SELECT n.person_id, s.day, coalesce(n.category, 'unknown') AS category,
-             sum(n.price_cents)::BIGINT AS amount
-      FROM ev_numbered n JOIN sessions s USING(person_id, session_no)
-      WHERE n.event_type='purchase'
-      GROUP BY n.person_id, s.day, coalesce(n.category, 'unknown')
-    """)
-    con.execute("""
-      CREATE TEMP TABLE user_daily AS
-      WITH totals AS (
-        SELECT person_id AS user_id, day, count(*)::BIGINT AS sessions,
-               sum(event_count)::BIGINT AS events,
-               sum(revenue_cents)::BIGINT AS revenue_cents
-        FROM sessions GROUP BY person_id, day
-      ), cats AS (
-        SELECT person_id, day, category,
-               row_number() OVER (PARTITION BY person_id,day
-                                  ORDER BY amount DESC, category ASC) AS rn
-        FROM user_cat_day
-      )
-      SELECT t.user_id, t.day, t.sessions, t.events, t.revenue_cents,
-             c.category AS top_category
-      FROM totals t LEFT JOIN cats c
-        ON c.person_id=t.user_id AND c.day=t.day AND c.rn=1
-    """)
+    best = {}
+    for eid, uid, ts, its, etype, pid, price in raw_events:
+        cur = best.get(eid)
+        if cur is None or its < cur[2]:
+            best[eid] = (uid, ts, its, etype, pid, price)
 
-    # Click IDs are deduplicated before validation. Duplicate copies are
-    # guaranteed identical by the challenge.
-    con.execute("""
-      CREATE TEMP TABLE click_dedup AS
-      SELECT *, ts_ms(ts) AS click_ms
-      FROM click_raw
-      WHERE click_id IS NOT NULL AND click_id <> ''
-      QUALIFY row_number() OVER (PARTITION BY click_id ORDER BY click_id)=1
-    """)
-    con.execute(f"""
-      CREATE TEMP TABLE clicks AS
-      SELECT coalesce(p.person_id,c.user_id) AS person_id,
-             c.click_id, c.campaign_id, c.click_ms
-      FROM click_dedup c
-      LEFT JOIN people p ON p.user_id=c.user_id
-      JOIN campaigns ca ON ca.campaign_id=c.campaign_id
-      WHERE c.user_id IS NOT NULL AND c.user_id <> ''
-        AND c.click_ms >= {start_ms - 604800000} AND c.click_ms < {end_ms}
-    """)
+    valid_events = []
+    for uid, ts, its, etype, pid, price in best.values():
+        if uid == "":
+            continue
+        if ts < window_start or ts >= window_end:
+            continue
+        if etype not in ("view", "cart", "purchase"):
+            continue
+        if pid == "":
+            continue
+        if etype == "purchase":
+            if not price or not RE_DIGITS.match(price):
+                continue
+            try:
+                pv = int(price)
+            except ValueError:
+                continue
+            if pv < 1 or pv > 10_000_000:
+                continue
+        if its - ts > MS_PER_DAY:
+            continue
+        valid_events.append((uid, ts, etype, pid, price))
 
-    # Qualifying clicks power both last-click credit and campaign assists.
-    con.execute("""
-      CREATE TEMP TABLE qualifying AS
-      SELECT s.person_id, s.session_no, s.day, s.start_ms, s.has_purchase,
-             s.revenue_cents, c.click_id, c.campaign_id, c.click_ms,
-             row_number() OVER (PARTITION BY s.person_id,s.session_no
-                                ORDER BY c.click_ms DESC, c.click_id ASC) AS rn
-      FROM sessions s JOIN clicks c ON c.person_id=s.person_id
-        AND c.click_ms <= s.start_ms AND c.click_ms >= s.start_ms - 604800000
-    """)
-    con.execute("""
-      CREATE TEMP TABLE credited AS
-      SELECT s.person_id, s.session_no, s.day, s.has_purchase, s.revenue_cents,
-             coalesce(q.campaign_id,'organic') AS campaign_id
-      FROM sessions s LEFT JOIN qualifying q
-        ON q.person_id=s.person_id AND q.session_no=s.session_no AND q.rn=1
-    """)
-    con.execute("""
-      CREATE TEMP TABLE assists AS
-      SELECT DISTINCT person_id, session_no, day, campaign_id
-      FROM qualifying
-    """)
-    con.execute("""
-      CREATE TEMP TABLE camp_credit AS
-      SELECT campaign_id, day, count(*)::BIGINT AS sessions,
-             sum(CASE WHEN has_purchase THEN 1 ELSE 0 END)::BIGINT AS purchasing_sessions,
-             sum(revenue_cents)::BIGINT AS revenue_cents
-      FROM credited GROUP BY campaign_id, day
-    """)
-    con.execute("""
-      CREATE TEMP TABLE camp_assist AS
-      SELECT campaign_id, day, count(*)::BIGINT AS assisted_sessions
-      FROM assists GROUP BY campaign_id, day
-    """)
-    con.execute("""
-      CREATE TEMP TABLE campaign_daily AS
-      SELECT coalesce(cc.campaign_id, aa.campaign_id) AS campaign_id,
-             CASE WHEN coalesce(cc.campaign_id,aa.campaign_id)='organic' THEN 'organic'
-                  ELSE ca.channel END AS channel,
-             coalesce(cc.day,aa.day) AS day,
-             coalesce(cc.sessions,0)::BIGINT AS sessions,
-             coalesce(cc.purchasing_sessions,0)::BIGINT AS purchasing_sessions,
-             coalesce(cc.revenue_cents,0)::BIGINT AS revenue_cents,
-             coalesce(aa.assisted_sessions,0)::BIGINT AS assisted_sessions
-      FROM camp_credit cc FULL OUTER JOIN camp_assist aa
-        ON cc.campaign_id=aa.campaign_id AND cc.day=aa.day
-      LEFT JOIN campaigns ca ON ca.campaign_id=coalesce(cc.campaign_id,aa.campaign_id)
-    """)
+    person_events = {}
+    for uid, ts, etype, pid, price in valid_events:
+        p = get_person(uid)
+        person_events.setdefault(p, []).append((ts, etype, pid, price))
 
-    checks = con.execute("""
-      SELECT (SELECT coalesce(sum(sessions),0) FROM user_daily),
-             (SELECT coalesce(sum(sessions),0) FROM campaign_daily),
-             (SELECT coalesce(sum(revenue_cents),0) FROM user_daily),
-             (SELECT coalesce(sum(revenue_cents),0) FROM campaign_daily)
-    """).fetchone()
-    if checks[0] != checks[1] or checks[2] != checks[3]:
-        raise RuntimeError(f"aggregation invariant failed: {checks}")
+    sessions = []
+    for p, evts in person_events.items():
+        evts.sort(key=lambda e: e[0])
+        session_start = None
+        n_ev = 0
+        revenue = 0
+        purchases = {}
+        prev_ts = None
+        for ts, etype, pid, price in evts:
+            if prev_ts is None or ts - prev_ts > SESSION_GAP_MS:
+                if session_start is not None:
+                    sessions.append((p, session_start, n_ev, revenue, purchases))
+                session_start = ts
+                n_ev = 0
+                revenue = 0
+                purchases = {}
+            n_ev += 1
+            prev_ts = ts
+            if etype == "purchase":
+                pv = int(price)
+                revenue += pv
+                cat = products.get(pid, "unknown")
+                purchases[cat] = purchases.get(cat, 0) + pv
+        if session_start is not None:
+            sessions.append((p, session_start, n_ev, revenue, purchases))
 
-    for table in ("user_daily", "campaign_daily"):
-        folder = os.path.join(OUT, table)
-        if os.path.exists(folder):
-            shutil.rmtree(folder)
-        os.makedirs(folder, exist_ok=True)
-        output_file = os.path.join(folder, "part-0.parquet")
-        con.execute(
-            f"COPY (SELECT * FROM {table}) TO {qpath(output_file)} "
-            "(FORMAT PARQUET, COMPRESSION ZSTD)"
-        )
-    print(f"wrote outputs; totals={checks}", flush=True)
-    con.close()
+    raw_clicks = []
+    for fpath in sorted(glob.glob(os.path.join(DATA, "clicks", "*.csv"))):
+        with open(fpath, "r", encoding="utf-8") as f:
+            f.readline()
+            for line in f:
+                fields = parse_csv_line(line.rstrip("\n"), 4)
+                if not fields:
+                    continue
+                cid, uid, camp_id, ts_str = fields
+                if cid == "":
+                    continue
+                ts = parse_ts(ts_str)
+                if ts is None:
+                    continue
+                raw_clicks.append((cid, uid, ts, camp_id))
+
+    click_map = {}
+    for cid, uid, ts, camp_id in raw_clicks:
+        click_map[cid] = (uid, ts, camp_id)
+
+    person_clicks = {}
+    for cid, (uid, ts, camp_id) in click_map.items():
+        if uid == "":
+            continue
+        if ts < click_window_start or ts >= window_end:
+            continue
+        if camp_id not in campaigns:
+            continue
+        p = get_person(uid)
+        person_clicks.setdefault(p, []).append((ts, camp_id, cid))
+
+    for p in person_clicks:
+        person_clicks[p].sort(key=lambda c: (c[0], c[2]))
+
+    MAX_CHAR = chr(0x10FFFF)
+    attr = []
+    for p, s_start, n_ev, revenue, purchases in sessions:
+        clicks = person_clicks.get(p, [])
+        lo = s_start - MS_PER_7_DAYS
+        hi = s_start
+        left = bisect.bisect_left(clicks, (lo, "", ""))
+        right = bisect.bisect_right(clicks, (hi, MAX_CHAR, MAX_CHAR))
+        best_click = None
+        assisting = set()
+        for i in range(left, right):
+            cts, ccamp, ccid = clicks[i]
+            assisting.add(ccamp)
+            if best_click is None or cts > best_click[0] or (cts == best_click[0] and ccid < best_click[2]):
+                best_click = (cts, ccamp, ccid)
+        credited = best_click[1] if best_click else "organic"
+        is_purchasing = revenue > 0
+        day = datetime.fromtimestamp(s_start / 1000, tzinfo=timezone.utc).date()
+        attr.append((p, day, credited, n_ev, revenue, purchases, assisting, is_purchasing))
+
+    user_agg = {}
+    for p, day, credited, n_ev, revenue, purchases, assisting, is_purchasing in attr:
+        key = (p, day)
+        if key not in user_agg:
+            user_agg[key] = [0, 0, 0, {}]
+        agg = user_agg[key]
+        agg[0] += 1
+        agg[1] += n_ev
+        agg[2] += revenue
+        for cat, amt in purchases.items():
+            agg[3][cat] = agg[3].get(cat, 0) + amt
+
+    user_rows = []
+    for (p, day), (sessions_n, events_n, revenue, cat_sums) in user_agg.items():
+        top_cat = None
+        if cat_sums:
+            best_cat = None
+            best_amt = -1
+            for cat, amt in cat_sums.items():
+                if amt > best_amt or (amt == best_amt and cat < best_cat):
+                    best_cat = cat
+                    best_amt = amt
+            top_cat = best_cat
+        user_rows.append((p, day, sessions_n, events_n, revenue, top_cat))
+
+    camp_agg = {}
+    for p, day, credited, n_ev, revenue, purchases, assisting, is_purchasing in attr:
+        key = (credited, day)
+        if key not in camp_agg:
+            camp_agg[key] = [0, 0, 0, 0]
+        agg = camp_agg[key]
+        agg[0] += 1
+        if is_purchasing:
+            agg[1] += 1
+        agg[2] += revenue
+        if credited != "organic":
+            for camp in assisting:
+                if camp == "organic":
+                    continue
+                akey = (camp, day)
+                if akey not in camp_agg:
+                    camp_agg[akey] = [0, 0, 0, 0]
+                camp_agg[akey][3] += 1
+
+    camp_rows = []
+    for (camp, day), (sessions_n, purchasing, revenue, assisted) in camp_agg.items():
+        channel = "organic" if camp == "organic" else campaigns.get(camp, "organic")
+        camp_rows.append((camp, channel, day, sessions_n, purchasing, revenue, assisted))
+
+    os.makedirs(os.path.join(OUT, "user_daily"), exist_ok=True)
+    os.makedirs(os.path.join(OUT, "campaign_daily"), exist_ok=True)
+
+    if user_rows:
+        df = pl.DataFrame({
+            "user_id": [r[0] for r in user_rows],
+            "day": [r[1] for r in user_rows],
+            "sessions": [r[2] for r in user_rows],
+            "events": [r[3] for r in user_rows],
+            "revenue_cents": [r[4] for r in user_rows],
+            "top_category": [r[5] for r in user_rows],
+        })
+    else:
+        df = pl.DataFrame(schema={"user_id": pl.String, "day": pl.Date, "sessions": pl.Int64,
+                                   "events": pl.Int64, "revenue_cents": pl.Int64, "top_category": pl.String})
+    df.write_parquet(os.path.join(OUT, "user_daily", "part-0.parquet"))
+
+    if camp_rows:
+        df = pl.DataFrame({
+            "campaign_id": [r[0] for r in camp_rows],
+            "channel": [r[1] for r in camp_rows],
+            "day": [r[2] for r in camp_rows],
+            "sessions": [r[3] for r in camp_rows],
+            "purchasing_sessions": [r[4] for r in camp_rows],
+            "revenue_cents": [r[5] for r in camp_rows],
+            "assisted_sessions": [r[6] for r in camp_rows],
+        })
+    else:
+        df = pl.DataFrame(schema={"campaign_id": pl.String, "channel": pl.String, "day": pl.Date,
+                                   "sessions": pl.Int64, "purchasing_sessions": pl.Int64,
+                                   "revenue_cents": pl.Int64, "assisted_sessions": pl.Int64})
+    df.write_parquet(os.path.join(OUT, "campaign_daily", "part-0.parquet"))
 
 
 if __name__ == "__main__":
