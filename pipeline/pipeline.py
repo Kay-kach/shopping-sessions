@@ -301,7 +301,7 @@ def main():
                 best_click = (cts, ccamp, ccid)
         credited = best_click[1] if best_click else "organic"
         is_purchasing = revenue > 0
-        day = datetime.fromtimestamp(s_start / 1000, tzinfo=timezone.utc).date()
+        day = datetime.fromtimestamp(s_start / 1000, tz=timezone.utc).date()
         attr.append((p, day, credited, n_ev, revenue, purchases, assisting, is_purchasing))
 
     user_agg = {}
